@@ -1,0 +1,224 @@
+<!doctype html>
+<html lang="es">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Diagnóstico BLE</title>
+<style>
+  :root{--bg:#f4f5f7;--card:#fff;--ink:#1c1f24;--muted:#6b7280;--accent:#d7263d;--ok:#16a34a;--line:#e5e7eb;--code:#0f172a;--codeink:#e2e8f0}
+  *{box-sizing:border-box}
+  body{margin:0;background:var(--bg);color:var(--ink);font:15px/1.45 system-ui,-apple-system,Segoe UI,Roboto,sans-serif;padding:16px}
+  h1{font-size:20px;margin:0 0 4px}
+  h2{font-size:16px;margin:0 0 10px}
+  .card{background:var(--card);border:1px solid var(--line);border-radius:12px;padding:14px;margin:12px 0}
+  button{font:inherit;border:0;border-radius:8px;padding:10px 14px;margin:4px 6px 4px 0;background:var(--ink);color:#fff}
+  button.sec{background:#e5e7eb;color:var(--ink)}
+  button:disabled{opacity:.4}
+  .hr{font-size:56px;font-weight:700;color:var(--accent);line-height:1;margin:12px 0 4px}
+  .hr small{font-size:18px;color:var(--muted);font-weight:500}
+  .meta,.hint{color:var(--muted);font-size:13px}
+  .warn{background:#fef3c7;border:1px solid #fcd34d;border-radius:8px;padding:8px 10px;font-size:13px}
+  .okmsg{color:var(--ok);font-size:13px}
+  label{display:block;font-size:13px;color:var(--muted);margin:8px 0}
+  input{width:100%;font:13px ui-monospace,monospace;padding:8px;border:1px solid var(--line);border-radius:8px;margin-top:4px}
+  .svc{border-left:3px solid var(--accent);padding:4px 0 4px 10px;margin:10px 0;font:12px ui-monospace,monospace;word-break:break-all}
+  .chr{margin:6px 0 6px 8px;color:var(--muted)}
+  .chr b{color:var(--ink)}
+  .weight{font-size:32px;font-weight:700;margin:8px 0}
+  pre{background:var(--code);color:var(--codeink);border-radius:8px;padding:10px;font:11px/1.5 ui-monospace,monospace;max-height:340px;overflow:auto;white-space:pre-wrap;word-break:break-all;margin:8px 0 0}
+</style>
+</head>
+<body>
+<h1>Diagnóstico BLE</h1>
+<div class="meta">Polar Verity Sense + báscula Active Era BS-06W</div>
+<div id="support"></div>
+
+<section class="card">
+  <h2>1 · Polar Verity Sense</h2>
+  <div class="hint">Enciende el sensor (botón hasta que parpadee) y póntelo en el brazo.</div>
+  <button id="btnPolar">Conectar Polar</button>
+  <button id="btnPolarOff" class="sec" disabled>Desconectar</button>
+  <div class="hr"><span id="bpm">--</span> <small>bpm</small></div>
+  <div class="meta">Batería: <span id="bat">--</span> · RR: <span id="rr">--</span></div>
+</section>
+
+<section class="card">
+  <h2>2 · Báscula</h2>
+  <div class="hint">Súbete a la báscula para encenderla y pulsa “Escanear”. Elige el dispositivo en la lista (anota su nombre). Una vez conectada, bájate y vuelve a subirte para que envíe una medición.</div>
+  <label>UUIDs de servicio extra (opcional, separados por coma — cópialos de nRF Connect si la página no ve nada)
+    <input id="extra" placeholder="ej: ffb0, 0000abcd-0000-1000-8000-00805f9b34fb">
+  </label>
+  <button id="btnScale">Escanear báscula</button>
+  <button id="btnScaleOff" class="sec" disabled>Desconectar</button>
+  <div id="weight" class="weight"></div>
+  <div id="tree"></div>
+</section>
+
+<section class="card">
+  <h2>3 · Registro</h2>
+  <div class="hint">Cuando termines, descarga o copia el registro y compártelo para decodificar la báscula.</div>
+  <button id="copy" class="sec">Copiar</button>
+  <button id="dl" class="sec">Descargar .txt</button>
+  <button id="clear" class="sec">Limpiar</button>
+  <pre id="log"></pre>
+</section>
+
+<script>
+const $ = id => document.getElementById(id);
+const lines = [];
+function log(msg){
+  const l = `[${new Date().toISOString().slice(11,23)}] ${msg}`;
+  lines.push(l);
+  $('log').textContent = lines.slice(-500).join('\n');
+  $('log').scrollTop = $('log').scrollHeight;
+}
+const hex = dv => Array.from(new Uint8Array(dv.buffer, dv.byteOffset, dv.byteLength))
+  .map(b => b.toString(16).padStart(2,'0')).join(' ');
+
+// ---------- Soporte ----------
+(function(){
+  const s = $('support');
+  if (!window.isSecureContext) s.innerHTML = '<p class="warn">La página no está en HTTPS: Web Bluetooth no funcionará. Ábrela desde una URL https://.</p>';
+  else if (!navigator.bluetooth) s.innerHTML = '<p class="warn">Este navegador no soporta Web Bluetooth. Usa Chrome en Android.</p>';
+  else s.innerHTML = '<p class="okmsg">✓ Web Bluetooth disponible</p>';
+  log('UA: ' + navigator.userAgent);
+})();
+
+// ---------- Polar ----------
+let polarDev = null;
+function parseHR(v){
+  const f = v.getUint8(0); let i = 1;
+  const bpm = (f & 0x01) ? v.getUint16(i, true) : v.getUint8(i);
+  i += (f & 0x01) ? 2 : 1;
+  if (f & 0x08) i += 2; // energía gastada
+  const rr = [];
+  if (f & 0x10) while (i + 1 < v.byteLength) { rr.push(Math.round(v.getUint16(i, true) / 1024 * 1000)); i += 2; }
+  return { bpm, rr };
+}
+$('btnPolar').onclick = async () => {
+  try {
+    polarDev = await navigator.bluetooth.requestDevice({
+      filters: [{ namePrefix: 'Polar' }],
+      optionalServices: ['heart_rate', 'battery_service', 'device_information']
+    });
+    polarDev.addEventListener('gattserverdisconnected', () => {
+      log('Polar desconectado'); $('btnPolarOff').disabled = true; $('btnPolar').disabled = false;
+    });
+    log('Conectando a ' + polarDev.name + ' (id ' + polarDev.id + ')');
+    const server = await polarDev.gatt.connect();
+    try {
+      const b = await (await server.getPrimaryService('battery_service')).getCharacteristic('battery_level');
+      const v = await b.readValue(); $('bat').textContent = v.getUint8(0) + '%'; log('Batería Polar: ' + v.getUint8(0) + '%');
+    } catch (e) { log('Batería no disponible: ' + e.message); }
+    const c = await (await server.getPrimaryService('heart_rate')).getCharacteristic('heart_rate_measurement');
+    c.addEventListener('characteristicvaluechanged', e => {
+      const r = parseHR(e.target.value);
+      $('bpm').textContent = r.bpm;
+      $('rr').textContent = r.rr.length ? r.rr.join(', ') + ' ms' : '--';
+      log(`FC ${r.bpm} bpm` + (r.rr.length ? ` · RR ${r.rr.join(',')} ms` : '') + ` · raw ${hex(e.target.value)}`);
+    });
+    await c.startNotifications();
+    $('btnPolar').disabled = true; $('btnPolarOff').disabled = false;
+    log('Recibiendo frecuencia cardíaca…');
+  } catch (e) { log('Error Polar: ' + e.name + ' — ' + e.message); }
+};
+$('btnPolarOff').onclick = () => polarDev?.gatt.connected && polarDev.gatt.disconnect();
+
+// ---------- Báscula ----------
+// Servicios estándar + UUIDs propietarios habituales en básculas OEM (QN/Yolanda, Chipsea, Fitdays…)
+const COMMON = [
+  'weight_scale', 'body_composition', 'user_data', 'device_information', 'battery_service', 'current_time',
+  0xfff0, 0xffe0, 0xffb0, 0xffa0, 0xffc0, 0xffd0, 0xfee7, 0xfe95, 0xfff1, 0x1910, 0xae00, 0xfb00,
+  '0000ffe0-0000-1000-8000-00805f9b34fb'
+];
+let scaleDev = null;
+
+function parseExtra(){
+  return $('extra').value.split(',').map(s => s.trim().toLowerCase()).filter(Boolean)
+    .map(s => /^(0x)?[0-9a-f]{4}$/.test(s) ? parseInt(s.replace('0x',''), 16) : s);
+}
+function decodeKnown(uuid, v){
+  // Weight Measurement estándar (0x2A9D)
+  if (uuid.startsWith('00002a9d')) {
+    const f = v.getUint8(0), raw = v.getUint16(1, true);
+    const w = (f & 1) ? (raw * 0.01).toFixed(2) + ' lb' : (raw * 0.005).toFixed(2) + ' kg';
+    $('weight').textContent = w; return 'Peso estándar: ' + w;
+  }
+  return '';
+}
+function propsOf(c){
+  return Object.entries({read:c.properties.read, write:c.properties.write, writeNR:c.properties.writeWithoutResponse,
+    notify:c.properties.notify, indicate:c.properties.indicate}).filter(([,x]) => x).map(([k]) => k).join(', ');
+}
+
+$('btnScale').onclick = async () => {
+  try {
+    const optionalServices = [...COMMON, ...parseExtra()];
+    scaleDev = await navigator.bluetooth.requestDevice({ acceptAllDevices: true, optionalServices });
+    log(`Dispositivo elegido: "${scaleDev.name || '(sin nombre)'}" id ${scaleDev.id}`);
+    scaleDev.addEventListener('gattserverdisconnected', () => {
+      log('Báscula desconectada'); $('btnScaleOff').disabled = true; $('btnScale').disabled = false;
+    });
+
+    // Anuncios BLE (muchas básculas mandan el peso aquí). Puede requerir chrome://flags → Experimental Web Platform features
+    if (scaleDev.watchAdvertisements) {
+      scaleDev.addEventListener('advertisementreceived', ev => {
+        const parts = [`RSSI ${ev.rssi}`];
+        ev.manufacturerData.forEach((dv, id) => parts.push(`MFR 0x${id.toString(16).padStart(4,'0')}: ${hex(dv)}`));
+        ev.serviceData.forEach((dv, u) => parts.push(`SVCDATA ${u}: ${hex(dv)}`));
+        log('ANUNCIO · ' + parts.join(' | '));
+      });
+      try { await scaleDev.watchAdvertisements(); log('Escuchando anuncios BLE de la báscula'); }
+      catch (e) { log('watchAdvertisements no disponible: ' + e.message); }
+    } else log('watchAdvertisements no soportado (activa Experimental Web Platform features en chrome://flags si hace falta)');
+
+    log('Conectando GATT…');
+    const server = await scaleDev.gatt.connect();
+    let services = [];
+    try { services = await server.getPrimaryServices(); }
+    catch (e) { log('No se listaron servicios: ' + e.message); }
+    log(`Servicios accesibles: ${services.length}`);
+    if (!services.length) log('⚠ Ninguno de los UUIDs conocidos coincidió. Revisa la báscula en nRF Connect y pega sus UUIDs en "UUIDs extra".');
+
+    const tree = $('tree'); tree.innerHTML = '';
+    for (const s of services) {
+      const div = document.createElement('div'); div.className = 'svc';
+      div.innerHTML = `<b>Servicio</b> ${s.uuid}`; tree.appendChild(div);
+      log('SERVICIO ' + s.uuid);
+      let chars = [];
+      try { chars = await s.getCharacteristics(); } catch (e) { log('  sin características: ' + e.message); }
+      for (const c of chars) {
+        const p = propsOf(c);
+        const row = document.createElement('div'); row.className = 'chr';
+        row.innerHTML = `<b>${c.uuid}</b> [${p}]`; div.appendChild(row);
+        log(`  CARACT ${c.uuid} [${p}]`);
+        if (c.properties.read) {
+          try { const v = await c.readValue(); log(`    READ ${c.uuid}: ${hex(v)}`); } catch (e) { log(`    READ falló: ${e.message}`); }
+        }
+        if (c.properties.notify || c.properties.indicate) {
+          c.addEventListener('characteristicvaluechanged', ev => {
+            const v = ev.target.value, extra = decodeKnown(c.uuid, v);
+            log(`NOTIF ${c.uuid}: ${hex(v)}` + (extra ? ' → ' + extra : ''));
+          });
+          try { await c.startNotifications(); log(`    suscrito a ${c.uuid}`); } catch (e) { log(`    suscripción falló: ${e.message}`); }
+        }
+      }
+    }
+    $('btnScale').disabled = true; $('btnScaleOff').disabled = false;
+    log('Listo. Bájate y vuelve a subir a la báscula para capturar una medición.');
+  } catch (e) { log('Error báscula: ' + e.name + ' — ' + e.message); }
+};
+$('btnScaleOff').onclick = () => { scaleDev?.gatt.connected && scaleDev.gatt.disconnect(); };
+
+// ---------- Registro ----------
+$('copy').onclick = async () => { try { await navigator.clipboard.writeText(lines.join('\n')); log('Registro copiado'); } catch (e) { log('No se pudo copiar: ' + e.message); } };
+$('dl').onclick = () => {
+  const a = document.createElement('a');
+  a.href = URL.createObjectURL(new Blob([lines.join('\n')], { type: 'text/plain' }));
+  a.download = 'diagnostico-ble-' + new Date().toISOString().slice(0,19).replace(/[:T]/g,'-') + '.txt';
+  a.click();
+};
+$('clear').onclick = () => { lines.length = 0; $('log').textContent = ''; };
+</script>
+</body>
+</html>
